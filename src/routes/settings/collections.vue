@@ -6,9 +6,11 @@
 					key="add"
 					icon="add"
 					:label="$t('new')"
+					:options="addOptions"
 					icon-color="button-primary-text-color"
 					background-color="button-primary-background-color"
 					@click="addNew = true"
+					@input="optionAction"
 				/>
 			</template>
 		</v-header>
@@ -65,6 +67,10 @@
 					>
 						{{ $t('manage') }}
 					</v-button>
+					<v-checkbox
+						:inputValue="isSelectedCollection(collection)"
+						@click.native.stop.prevent="toggleSelection(collection)"
+					></v-checkbox>
 				</router-link>
 			</div>
 		</div>
@@ -103,6 +109,22 @@
 				@confirm="stopManaging"
 			/>
 		</portal>
+
+		<portal v-if="importData" to="modal">
+			<v-modal
+				:title="$t('import')"
+				:buttons="importDataButtons"
+				@import="importFile"
+				@close="importData = false"
+			>
+				<div class="import-data">
+					<v-input type="file" @input="uploadImportFile" ref="uploadField" />
+					<div v-if="importDataError" class="error">{{ importDataError }}</div>
+					<!-- <v-spinner /> -->
+				</div>
+			</v-modal>
+		</portal>
+
 		<v-info-sidebar wide>
 			<span class="type-note">No settings</span>
 		</v-info-sidebar>
@@ -111,6 +133,7 @@
 
 <script>
 import { mapState } from 'vuex';
+import { saveAs } from 'file-saver';
 
 export default {
 	name: 'SettingsCollections',
@@ -132,7 +155,12 @@ export default {
 			modifiedOn: false,
 
 			dontManage: null,
-			toManage: []
+			toManage: [],
+
+			selectedCollection: [],
+			importData: false,
+			importedFile: null,
+			importDataError: null
 		};
 	},
 	computed: {
@@ -158,9 +186,45 @@ export default {
 					path: `/${this.currentProjectKey}/settings/collections`
 				}
 			];
+		},
+		addOptions() {
+			let exportOptions = {};
+			if (this.selectedCollection.length > 0) {
+				exportOptions = {
+					export: {
+						text: this.$t('export'),
+						icon: 'cloud_download'
+					},
+					export_data: {
+						text: this.$t('export_with_data'),
+						icon: 'cloud_download'
+					}
+				};
+			}
+			return {
+				import: {
+					text: this.$t('import'),
+					icon: 'cloud_upload'
+				},
+				...exportOptions
+			};
+		},
+		hasSelectedCollection() {
+			return this.selectedCollection.length > 0;
+		},
+		importDataButtons() {
+			return {
+				import: {
+					text: this.$t('import'),
+					disabled: this.importedFile === null
+				}
+			};
 		}
 	},
 	methods: {
+		isSelectedCollection(collection) {
+			return this.selectedCollection.includes(collection);
+		},
 		add() {
 			this.adding = true;
 
@@ -588,6 +652,16 @@ export default {
 					});
 			}
 		},
+		toggleSelection(collection) {
+			let index = this.selectedCollection.indexOf(collection);
+			if (index === -1) {
+				this.selectedCollection = [...this.selectedCollection, collection];
+			} else {
+				this.selectedCollection = [
+					...this.selectedCollection.filter(c => c !== collection)
+				];
+			}
+		},
 		stopManaging() {
 			const dontManage = this.dontManage;
 			this.toManage.push(dontManage.collection.collection);
@@ -618,6 +692,90 @@ export default {
 					);
 					this.dontManage = null;
 				});
+		},
+		optionAction(method) {
+			if (method === 'import') {
+				this.importedFile = null;
+				this.importData = true;
+			} else if (['export', 'export_data'].includes(method)) {
+				const withData = method === 'export_data';
+				let exportInfo = {
+					structures: [],
+					datas: {}
+				};
+				let exportStructuresProcess = Promise.all(
+					this.selectedCollection.map(collection =>
+						this.$api.getCollection(collection.collection)
+					)
+				);
+				const exportStructuresGlobal = exportStructuresProcess.then(structs => {
+					exportInfo.structures = [...structs.map(s => s.data)];
+				});
+				let exportDatasProcess = Promise.all(
+					withData
+						? this.selectedCollection.map(collection =>
+								this.$api.getItems(collection.collection).then(rep => ({
+									[collection.collection]: rep.data
+								}))
+						  )
+						: []
+				);
+				const exportDatasGlobal = exportDatasProcess.then(datas => {
+					exportInfo.datas = datas.reduce((r, d) => ({ ...r, ...d }), {});
+				});
+
+				Promise.all([exportStructuresGlobal, exportDatasGlobal]).then(() => {
+					const blob = new Blob([JSON.stringify(exportInfo)], {
+						type: 'text/plain;charset=utf-8'
+					});
+					saveAs(blob, 'directus.sav');
+					console.log(JSON.stringify(exportInfo, null, 4));
+				});
+			}
+		},
+		importFile() {
+			Promise.all(
+				this.importedFile.structures.map(c => {
+					Object.values(c.fields).forEach(f => {
+						delete f.id;
+					});
+					return this.$api
+						.createCollection(c)
+						.then(() =>
+							this.importedFile.datas[c.collection] !== undefined
+								? this.$api.createItems(
+										c.collection,
+										this.importedFile.datas[c.collection]
+								  )
+								: true
+						);
+				})
+			).then(() => {
+				this.importData = false;
+				this.importedFile = null;
+			});
+		},
+		uploadImportFile() {
+			this.importedFile = null;
+			this.importDataError = null;
+			const field = this.$refs.uploadField.$el.getElementsByTagName('input')[0];
+			if (field.files.length == 0) return;
+
+			const file = field.files[0];
+			const reader = new FileReader();
+			reader.onload = event => {
+				const content = event.target.result;
+				try {
+					this.importedFile = JSON.parse(content);
+				} catch (error) {
+					this.importDataError = this.$t('invalide_file_format');
+					this.$events.emit('error', {
+						notify: this.importDataError,
+						error
+					});
+				}
+			};
+			reader.readAsText(file, 'utf-8');
 		}
 	}
 };
@@ -693,7 +851,11 @@ export default {
 
 	.v-button {
 		position: absolute;
-		right: 12px;
+		right: 38px;
+	}
+	.v-checkbox {
+		position: absolute;
+		right: 9px;
 	}
 }
 
@@ -705,6 +867,21 @@ export default {
 		display: grid;
 		grid-gap: 20px;
 		grid-template-columns: 1fr 1fr;
+	}
+}
+
+.import-data {
+	border-bottom: 2px solid var(--modal-header-background-color);
+	padding: 8px 32px;
+	// padding-right: 32px;
+	align-items: center;
+
+	.v-input {
+		width: 100%;
+	}
+	.error {
+		font-style: italic;
+		color: var(--danger);
 	}
 }
 </style>
